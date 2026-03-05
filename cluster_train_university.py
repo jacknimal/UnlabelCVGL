@@ -402,16 +402,15 @@ def main_worker_stage1_intra_view(args):
             del cluster_loader_satellite
 
             # DINOv2 天然对齐，彻底摈弃暴力的 repeat 操作，直接算距离矩阵
-            rerank_dist_satellite = compute_jaccard_distance(features_satellite, k1=args.k1, k2=args.k2,
-                                                             search_option=3, logger=logger)
-            pseudo_labels_satellite = cluster_s.fit_predict(rerank_dist_satellite)
+            num_satellite_imgs = features_satellite.size(0)
+            pseudo_labels_satellite = np.arange(num_satellite_imgs)
             rerank_dist_drone = compute_jaccard_distance(features_drone, k1=args.k1, k2=args.k2, search_option=3,
                                                          logger=logger)
             pseudo_labels_drone = cluster_d.fit_predict(rerank_dist_drone)
 
             log_cluster_statistics(pseudo_labels_satellite, stage="Satellite")
             log_cluster_statistics(pseudo_labels_drone, stage="Drone")
-            del rerank_dist_drone, rerank_dist_satellite
+            del rerank_dist_drone
 
             num_cluster_s = len(set(pseudo_labels_satellite)) - (1 if -1 in pseudo_labels_satellite else 0)
             num_cluster_d = len(set(pseudo_labels_drone)) - (1 if -1 in pseudo_labels_drone else 0)
