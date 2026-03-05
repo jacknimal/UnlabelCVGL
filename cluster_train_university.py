@@ -44,23 +44,25 @@ from transformers import get_constant_schedule_with_warmup, get_polynomial_decay
     get_cosine_schedule_with_warmup
 
 # ==============================================================================
-# --- 动态日志目录配置 ---
+# --- 动态日志与权重归档目录配置 ---
 # ==============================================================================
-# 1. 获取当前时间戳作为文件夹名称 (格式: YYYY-MM-DD_HH-MM-SS)
+# 1. 获取当前时间戳作为统一的文件夹名称 (格式: YYYY-MM-DD_HH-MM-SS)
 current_time_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-# 2. 定义存放路径: 当前主目录下的 outs/时间戳/
+
+# 2. 定义并创建日志存放路径: 当前主目录下的 outs/时间戳/
 log_dir = os.path.join("outs", current_time_str)
-# 3. 创建文件夹 (如果 outs 不存在也会一并创建)
 os.makedirs(log_dir, exist_ok=True)
-# 4. 定义日志文件路径
 log_file_path = os.path.join(log_dir, "log.txt")
+
+# 3. 定义并创建 Stage 2 权重存放路径: 当前主目录下的 stageouts/时间戳/
+stage2_out_dir = os.path.join("stageouts", current_time_str)
+os.makedirs(stage2_out_dir, exist_ok=True)
 
 # --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
-    # 将原来的 'app.log' 替换为动态生成的 log_file_path
     handlers=[logging.FileHandler(log_file_path, encoding='utf-8'), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
@@ -70,7 +72,7 @@ logger = logging.getLogger(__name__)
 # 核心架构升级: DINOv2 + LoRA 微调模块
 # ==============================================================================
 class LoRALinear(nn.Module):
-    def __init__(self, original_linear, r=8, alpha=8):
+    def __init__(self, original_linear, r=16, alpha=32):
         super().__init__()
         self.original_linear = original_linear
         self.r = r
@@ -96,7 +98,7 @@ def inject_lora(model, r=8, alpha=8):
 
 
 class DINOv2_Geo(nn.Module):
-    def __init__(self, pretrained_path, r=8):
+    def __init__(self, pretrained_path, r=16, alpha=32):
         super().__init__()
         logger.info(f"Loading DINOv2 from {pretrained_path}...")
         self.backbone = torch.hub.load('./facebookresearch_dinov2_main/dinov2', 'dinov2_vitb14', source='local',
@@ -107,7 +109,7 @@ class DINOv2_Geo(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        inject_lora(self.backbone, r=r, alpha=r)
+        inject_lora(self.backbone, r=r, alpha=alpha)
 
         self.embed_dim = 768
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
@@ -362,7 +364,7 @@ def main_worker_stage1_intra_view(args):
 
     # 加载 DINOv2 及其 LoRA
     model_pretrained_path = osp.join(args.model_path, 'dinov2_vitb14_pretrain.pth')
-    model = DINOv2_Geo(pretrained_path=model_pretrained_path, r=8)
+    model = DINOv2_Geo(pretrained_path=model_pretrained_path, r=16, alpha=32)
 
     if torch.cuda.device_count() > 1 and len(args.gpu_ids) > 1:
         model = torch.nn.DataParallel(model, device_ids=args.gpu_ids)
@@ -380,6 +382,7 @@ def main_worker_stage1_intra_view(args):
             if epoch == 0:
                 # DINOv2 特征紧凑，DBSCAN eps 建议维持在 0.75 上下
                 cluster_d = DBSCAN(eps=0.75, min_samples=5, metric='precomputed', n_jobs=-1)
+                cluster_s = DBSCAN(eps=0.75, min_samples=6, metric='precomputed', n_jobs=-1)
 
             logger.info('==> Extracting features for clustering...')
             cluster_loader_drone = get_test_loader(sorted(drone_dataset.dataset), height=args.height, width=args.width,
@@ -398,18 +401,17 @@ def main_worker_stage1_intra_view(args):
                 [features_satellite[f].unsqueeze(0) for f, _ in sorted(satellite_dataset.dataset)], 0)
             del cluster_loader_satellite
 
-            # 【完美优化】卫星视图无需聚类，每张图就是一个独立的类别 (0, 1, 2, ..., N-1)
-            num_satellite_imgs = features_satellite.size(0)
-            pseudo_labels_satellite = np.arange(num_satellite_imgs)
-
-            # 无人机继续保留 DBSCAN
+            # DINOv2 天然对齐，彻底摈弃暴力的 repeat 操作，直接算距离矩阵
+            rerank_dist_satellite = compute_jaccard_distance(features_satellite, k1=args.k1, k2=args.k2,
+                                                             search_option=3, logger=logger)
+            pseudo_labels_satellite = cluster_s.fit_predict(rerank_dist_satellite)
             rerank_dist_drone = compute_jaccard_distance(features_drone, k1=args.k1, k2=args.k2, search_option=3,
                                                          logger=logger)
             pseudo_labels_drone = cluster_d.fit_predict(rerank_dist_drone)
 
             log_cluster_statistics(pseudo_labels_satellite, stage="Satellite")
             log_cluster_statistics(pseudo_labels_drone, stage="Drone")
-            del rerank_dist_drone
+            del rerank_dist_drone, rerank_dist_satellite
 
             num_cluster_s = len(set(pseudo_labels_satellite)) - (1 if -1 in pseudo_labels_satellite else 0)
             num_cluster_d = len(set(pseudo_labels_drone)) - (1 if -1 in pseudo_labels_drone else 0)
@@ -438,7 +440,6 @@ def main_worker_stage1_intra_view(args):
         trainer.memory_satellite = memory_satellite
         trainer.memory_drone = memory_drone
 
-        # pseudo_labels_satellite 已经是 numpy 数组，可以直接取 item() 进行匹配打包
         pseudo_labeled_dataset_satellite = [(fname, label.item()) for (fname, _), label in
                                             zip(sorted(satellite_dataset.dataset), pseudo_labels_satellite) if
                                             label != -1]
@@ -505,7 +506,7 @@ def main_worker_stage2_inter_view(args):
     satellite_dataset = university_satellite(root=args.dataset, logger=logger)
 
     model_pretrained_path = osp.join(args.model_path, 'dinov2_vitb14_pretrain.pth')
-    model = DINOv2_Geo(pretrained_path=model_pretrained_path, r=8)
+    model = DINOv2_Geo(pretrained_path=model_pretrained_path, r=16, alpha=32)
 
     if args.checkpoint_start is not None and os.path.exists(args.checkpoint_start):
         logger.info(f"Loading Stage 1 weights from: {args.checkpoint_start}")
@@ -615,7 +616,8 @@ def main_worker_stage2_inter_view(args):
 
             if r1_test > best_score:
                 best_score = r1_test
-                save_model_path = osp.join(args.model_path, f'dinov2_weights_e{epoch}_{r1_test:.4f}.pth')
+                # 🌟 修改点：将目标文件夹换成了刚才配置好的 stage2_out_dir
+                save_model_path = osp.join(stage2_out_dir, f'dinov2_weights_e{epoch}_{r1_test:.4f}.pth')
                 if torch.cuda.device_count() > 1 and len(args.gpu_ids) > 1:
                     torch.save(model.module.state_dict(), save_model_path)
                 else:
